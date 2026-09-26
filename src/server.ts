@@ -62,6 +62,11 @@ import {
   removePlaceInputSchema,
 } from "./tools/remove-place.js";
 import {
+  moveBlock,
+  moveBlockDescription,
+  moveBlockInputSchema,
+} from "./tools/move-block.js";
+import {
   searchPlaces,
   searchPlacesDescription,
   searchPlacesInputSchema,
@@ -468,6 +473,16 @@ export function buildServer(ctx: AppContext): McpServer {
   );
 
   server.registerTool(
+    "wanderlog_move_block",
+    {
+      title: "Move a block within its itinerary section",
+      description: moveBlockDescription,
+      inputSchema: moveBlockInputSchema,
+    },
+    requireAuth(ctx, async (args) => moveBlock(ctx, args as Parameters<typeof moveBlock>[1])),
+  );
+
+  server.registerTool(
     "wanderlog_edit_note",
     {
       title: "Edit note content in a Wanderlog trip",
@@ -559,6 +574,12 @@ export function buildServer(ctx: AppContext): McpServer {
       title: "Add a custom section to a Wanderlog trip",
       description: addSectionDescription,
       inputSchema: addSectionInputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
     },
     requireAuth(ctx, async (args) =>
       addSection(ctx, args as Parameters<typeof addSection>[1])),
@@ -570,6 +591,12 @@ export function buildServer(ctx: AppContext): McpServer {
       title: "Rename a custom section in a Wanderlog trip",
       description: updateSectionDescription,
       inputSchema: updateSectionInputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
     },
     requireAuth(ctx, async (args) =>
       updateSection(ctx, args as Parameters<typeof updateSection>[1])),
@@ -581,6 +608,12 @@ export function buildServer(ctx: AppContext): McpServer {
       title: "Delete a custom section from a Wanderlog trip",
       description: deleteSectionDescription,
       inputSchema: deleteSectionInputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
     },
     requireAuth(ctx, async (args) =>
       deleteSection(ctx, args as Parameters<typeof deleteSection>[1])),

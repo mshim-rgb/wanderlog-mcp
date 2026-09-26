@@ -48,7 +48,8 @@ async function withSubmitLock<T>(
  * Rules:
  * - Per-trip mutex: concurrent calls on the same trip serialize automatically.
  * - Each successful batch is applied to the stable entry before `submit` returns.
- * - Only submit/apply failures invalidate the cache; callback errors do not.
+ * - Ambiguous submit failures and local apply failures invalidate the cache.
+ * - Confirmed server rejections and callback errors leave the cache intact.
  */
 export async function submitOp<T>(
   ctx: AppContext,
@@ -61,16 +62,23 @@ export async function submitOp<T>(
   return withSubmitLock(tripKey, async () => {
     const entry = await ctx.tripCache.getEntry(tripKey);
     const client = ctx.pool.get(tripKey);
-    if (!client.isSubscribed) {
-      throw new WanderlogError(
-        `Trip ${tripKey} is not subscribed`,
-        "not_subscribed",
-      );
-    }
-
     const submit = async (ops: Json0Op[]): Promise<void> => {
       try {
+        if (!client.isSubscribed) {
+          throw new WanderlogError(
+            `Trip ${tripKey} is not subscribed`,
+            "not_subscribed",
+          );
+        }
         await submitWithRateLimitRetry(client, ops);
+      } catch (err) {
+        if (!isConfirmedNonApplication(err)) {
+          ctx.tripCache.invalidate(tripKey);
+        }
+        throw err;
+      }
+
+      try {
         ctx.tripCache.applyLocalOp(tripKey, ops, client.version);
       } catch (err) {
         ctx.tripCache.invalidate(tripKey);
@@ -80,6 +88,20 @@ export async function submitOp<T>(
 
     return mutate(entry, submit);
   });
+}
+
+const CONFIRMED_NON_APPLICATION_CODES = new Set([
+  "empty_op",
+  "rate_limited",
+  "ws_not_open",
+  "ws_op_rejected",
+]);
+
+function isConfirmedNonApplication(err: unknown): boolean {
+  return (
+    err instanceof WanderlogError &&
+    CONFIRMED_NON_APPLICATION_CODES.has(err.code)
+  );
 }
 
 const RATE_LIMIT_RETRY_DELAYS_MS = [2_000, 4_000, 8_000];
@@ -145,17 +167,63 @@ export function findSectionByRef(
   trip: TripPlan,
   ref: string,
 ): { index: number; section: Section } | null {
+  const resolved = resolveSectionRef(trip, ref);
+  return resolved.kind === "unique" ? resolved.match : null;
+}
+
+export type SectionMatch = { index: number; section: Section };
+
+export type SectionRefResult =
+  | { kind: "unique"; match: SectionMatch }
+  | { kind: "ambiguous"; candidates: SectionMatch[] }
+  | { kind: "none" };
+
+/**
+ * Resolve a section heading without silently picking the first duplicate.
+ * The default list aliases remain unambiguous because they resolve by section
+ * identity instead of heading. All other headings return every match so
+ * mutation tools can fail safely when a trip contains duplicate list names.
+ */
+export function resolveSectionRef(trip: TripPlan, ref: string): SectionRefResult {
   const normalized = ref.trim().toLowerCase();
   if (normalized === "places to visit" || normalized === "places") {
-    return findPlacesToVisitSection(trip);
+    const found = findPlacesToVisitSection(trip);
+    return found ? { kind: "unique", match: found } : { kind: "none" };
   }
+
+  const candidates: SectionMatch[] = [];
   for (let i = 0; i < trip.itinerary.sections.length; i++) {
-    const s = trip.itinerary.sections[i]!;
-    if (s.heading.trim().toLowerCase() === normalized) {
-      return { index: i, section: s };
+    const section = trip.itinerary.sections[i]!;
+    if (section.heading.trim().toLowerCase() === normalized) {
+      candidates.push({ index: i, section });
     }
   }
-  return null;
+  if (candidates.length === 0) return { kind: "none" };
+  if (candidates.length === 1) return { kind: "unique", match: candidates[0]! };
+  return { kind: "ambiguous", candidates };
+}
+
+const SYSTEM_SECTION_TYPES = new Set([
+  "hotels",
+  "flights",
+  "transit",
+  "rentalCars",
+]);
+
+export function isSystemSection(section: Section): boolean {
+  return SYSTEM_SECTION_TYPES.has(section.type);
+}
+
+/** Custom undated lists that users may rename, delete, or reorder. */
+export function isCustomSection(trip: TripPlan, index: number): boolean {
+  const section = trip.itinerary.sections[index];
+  if (!section || section.mode === "dayPlan" || isSystemSection(section)) return false;
+  return findPlacesToVisitSection(trip)?.index !== index;
+}
+
+export function describeSection(section: Section): string {
+  if (section.mode === "dayPlan" && section.date) return `day ${section.date}`;
+  return `section "${section.heading || "(untitled)"}"`;
 }
 
 export function findBlockById(
@@ -348,6 +416,38 @@ export function findTargetSection(
     );
   }
   return { index: places.index, section: places.section, label: "places to visit" };
+}
+
+/**
+ * Resolves a block target when callers support both dated days and named
+ * undated sections. A named section takes precedence over a day, matching the
+ * public add-note/add-checklist contract.
+ */
+export function findBlockTargetSection(
+  trip: TripPlan,
+  target: { day?: string; section?: string },
+  blockLabel: string,
+): TargetSection {
+  if (target.section !== undefined) {
+    const found = findSectionByRef(trip, target.section);
+    if (!found) {
+      throw new WanderlogValidationError(
+        `Section "${target.section}" not found in trip "${trip.title}". Use wanderlog_get_trip to see available sections.`,
+      );
+    }
+    if (found.section.mode === "dayPlan") {
+      throw new WanderlogValidationError(
+        `Section "${found.section.heading || target.section}" is a dated section. Use the "day" parameter to add a ${blockLabel} to an itinerary day.`,
+      );
+    }
+    return {
+      index: found.index,
+      section: found.section,
+      label: `section "${found.section.heading || target.section}"`,
+    };
+  }
+
+  return findTargetSection(trip, target.day);
 }
 
 /** Build a note block matching the shape captured from the Wanderlog UI. */
